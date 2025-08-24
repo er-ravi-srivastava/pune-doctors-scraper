@@ -70,7 +70,7 @@ def summarize_reviews(reviews: List[Dict[str, Any]]) -> str:
     return " | ".join(snippets) if snippets else "—"
 
 # ---------- UI ----------
-st.title("Pune Doctors Scraper (Google Places)")
+st.title("Search Doctors and Clinics in Pune")
 
 default_areas = ["Aundh, Pune", "Baner, Pune", "Wakad, Pune"]
 areas = st.multiselect("Areas", default_areas, default=default_areas)
