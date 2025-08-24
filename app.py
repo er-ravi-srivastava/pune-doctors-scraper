@@ -82,11 +82,11 @@ specialties = st.multiselect(
     default=["dermatologist","cardiologist","pediatrician"],
 )
 
-max_results_per_query = st.slider("Max places per query", 5, 50, 15)
-include_reviews = st.checkbox("Include short review snippets (slower)", value=False)
-threads = st.slider("Parallel detail lookups", 1, 10, 6)
+max_results_per_query = st.slider("Number of results per search", 5, 50, 15)
+include_reviews = st.checkbox("Show sample reviews", value=False)
+threads = st.slider("Search speed (higher = faster, lower = safer)", 1, 10, 6)
 
-if st.button("Run scraper"):
+if st.button("Find Doctors"):
     progress = st.progress(0)
     status = st.empty()
     rows: List[Dict[str, Any]] = []
