@@ -1,7 +1,5 @@
 # 🏥 Pune Doctors Scraper 
 
-Deployed: https://doctor-finder-pune.streamlit.app/
-
 A Python-based tool to collect publicly available information about doctors in Pune and export it to Excel.  
 You can run it from the **command line** or via a **Streamlit web UI**.
 
