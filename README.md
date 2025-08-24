@@ -14,7 +14,5 @@ You can run it from the **command line** or via a **simple web UI**.
 - Configurable using a `.env` file.
 - Includes helper script (`check_excel.py`) to validate Excel files.
 
----
 
-## 📁 Project Structure
 
