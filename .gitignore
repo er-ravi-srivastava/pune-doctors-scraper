@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+
+# Env
+.env
+
+# VS Code
+.vscode/
+
+# Excel outputs
+*.xlsx
