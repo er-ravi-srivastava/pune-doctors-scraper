@@ -253,7 +253,7 @@ with st.sidebar:
         ],
         default=["dermatologist", "cardiologist", "pediatrician"],
     )
-    max_total_results = st.slider("Max results (area total)", 50, 500, 200, step=50)
+    max_total_results = st.slider("Max results (area total)" , 10, 100, 10, step=5)
     include_reviews = st.checkbox("Include review snippets", value=False)
     threads = st.slider("Parallel requests", 1, 10, 6)
     run = st.button("Find Doctors")
