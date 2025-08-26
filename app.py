@@ -4,7 +4,7 @@
 # Google Places API (v1) with robust pagination (up to 500 target)
 # ---------------------------------------------
 from __future__ import annotations
-
+from crawler import crawl_doctor_site 
 import os
 import re
 import time
@@ -280,6 +280,8 @@ if run:
         # Text Search with robust pagination (20 per page + 2s token delay)
         try:
             place_summaries = paginate_text_search(query, total_needed=per_specialty_budget, center=center)
+            print(f"\n=== RAW TEXT_SEARCH JSON for {query} ===")
+            print(place_summaries)
         except Exception as e:
             st.warning(f"Text search failed for '{query}': {e}")
             continue
@@ -298,6 +300,8 @@ if run:
                 p = futures[fut]
                 try:
                     det = fut.result()
+                    print(f"\n=== RAW PLACE_DETAILS JSON for {p.get('id')} ===")
+                    print(det)
                 except Exception as e:
                     st.info(f"Details failed for {p.get('id')}: {e}")
                     continue
@@ -313,15 +317,37 @@ if run:
                 summary = summarize_reviews(det.get("reviews", [])) if include_reviews else "N/A"
                 recommendation = make_recommendation(rating, count)
 
+                contact_email, years_exp = "N/A", "N/A"
+
+                # if website != "N/A":
+                #     try:
+                #         info = crawl_doctor_site(website)
+                #         if info.get("email"):
+                #             contact_email = info["email"]
+                #         if info.get("experience"):
+                #             years_exp = info["experience"]
+                #     except Exception as e:
+                #         st.info(f"Failed to crawl {website}: {e}")
+
+                if website != "N/A":
+                    crawl_future = ex.submit(crawl_doctor_site, website)
+                    try:
+                        info = crawl_future.result(timeout=8)  # timeout so one site doesn’t hang forever
+                        contact_email = info.get("email", "N/A")
+                        years_exp = info.get("years_of_experience", "N/A")
+                    except Exception as e:
+                        pass
+
+
                 rows.append(
                     {
                         "Complete address": addr,
                         "Doctor name": doc_name if doc_name else "N/A",
                         "Specialty": sp.title(),
                         "Clinic/Hospital": clinic_name if clinic_name else "N/A",
-                        "Years of experience": "N/A",
+                        "Years of experience": years_exp if years_exp else "N/A",
                         "Contact number": phone,
-                        "Contact email": "N/A",
+                        "Contact email": contact_email if contact_email else "N/A",
                         "Website": website,
                         "Ratings": rating if rating is not None else "N/A",
                         "Reviews": count if count is not None else "N/A",
