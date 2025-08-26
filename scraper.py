@@ -1,4 +1,5 @@
 import os
+import json
 import time
 import math
 import requests
@@ -56,6 +57,7 @@ def text_search(query: str, page_token: str | None = None) -> Dict[str, Any]:
         timeout=30
     )
     r.raise_for_status()
+    print(json.dumps(r.json(), indent=2, ensure_ascii=False))  
     return r.json()
 
 def place_details(place_id: str) -> Dict[str, Any]:
