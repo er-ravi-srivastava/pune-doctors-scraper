@@ -3,7 +3,7 @@
 A Python-based tool to collect publicly available information about doctors and clinics in Pune using the Google Places API.
 The results can be explored through a Streamlit web app or exported into an Excel file for further use.
 
-👉 Live demo: doctor-finder-pune.streamlit.app
+👉 Deployed Link: doctor-finder-pune.streamlit.app
 
 
 🎯 Objective
