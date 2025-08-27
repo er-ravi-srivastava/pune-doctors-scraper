@@ -374,7 +374,7 @@ if run:
                         # "Website": website,
                         "Ratings": rating if rating is not None else "N/A",
                         "Reviews": count if count is not None else "N/A",
-                        "Summary of Pros and Cons (reviews) + Recommendation": combined_summary,
+                        "Summary of Pros and Cons and Recommendation": combined_summary,
                     }
                 )
 
