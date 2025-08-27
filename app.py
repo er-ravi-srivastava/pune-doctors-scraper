@@ -12,6 +12,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import streamlit as st
 
 # =========================
@@ -19,6 +21,23 @@ import streamlit as st
 # =========================
 st.set_page_config(page_title="Search Doctors and Clinics in Pune", layout="wide")
 st.title("Search Doctors and Clinics in Pune")
+
+# =========================
+# HTTP session with pooling & retries (faster)
+# =========================
+SESSION = requests.Session()
+_retries = Retry(
+    total=3,
+    backoff_factor=0.6,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET", "POST"],
+    raise_on_status=False,
+)
+adapter = HTTPAdapter(max_retries=_retries, pool_connections=64, pool_maxsize=64)
+SESSION.mount("https://", adapter)
+SESSION.mount("http://", adapter)
+
+DEFAULT_TIMEOUT = 12  # tighter than before for faster failure
 
 # =========================
 # API key loading
@@ -86,8 +105,8 @@ def _headers(field_mask: str) -> dict:
         "X-Goog-FieldMask": field_mask,
     }
 
-def _post_json(url: str, headers: dict, payload: dict, timeout: int = 30) -> dict:
-    r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+def _post_json(url: str, headers: dict, payload: dict, timeout: int = DEFAULT_TIMEOUT) -> dict:
+    r = SESSION.post(url, headers=headers, json=payload, timeout=timeout)
     if r.status_code >= 400:
         try:
             st.warning(r.json())
@@ -96,8 +115,8 @@ def _post_json(url: str, headers: dict, payload: dict, timeout: int = 30) -> dic
         r.raise_for_status()
     return r.json()
 
-def _get_json(url: str, headers: dict, timeout: int = 30) -> dict:
-    r = requests.get(url, headers=headers, timeout=timeout)
+def _get_json(url: str, headers: dict, timeout: int = DEFAULT_TIMEOUT) -> dict:
+    r = SESSION.get(url, headers=headers, timeout=timeout)
     if r.status_code >= 400:
         try:
             st.warning(r.json())
@@ -110,10 +129,10 @@ def _get_json(url: str, headers: dict, timeout: int = 30) -> dict:
 # Helpers
 # =========================
 def backoff_sleep(attempt: int) -> None:
-    time.sleep(1.25 * (attempt + 1))
+    time.sleep(0.9 * (attempt + 1))
 
 def retry_request(fn, *args, **kwargs):
-    tries = kwargs.pop("tries", 4)
+    tries = kwargs.pop("tries", 3)
     for attempt in range(tries):
         try:
             return fn(*args, **kwargs)
@@ -172,25 +191,35 @@ def paginate_text_search(
     - we still need more results
     """
     results: List[Dict[str, Any]] = []
-    token: Optional[str] = None
+    token: Optional[Tuple[str, int]] = None  # (token, page_size)
     while len(results) < total_needed:
         remaining = total_needed - len(results)
         page_size = min(20, remaining)
         data = retry_request(
-            text_search_page, query, page_token=token, page_size=page_size, center=center
+            text_search_page, query, page_token=(token[0] if token else None), page_size=page_size, center=center
         )
         page_places = data.get("places") or []
         results.extend(page_places)
-        token = data.get("nextPageToken")
-        if not token:
+        nxt = data.get("nextPageToken")
+        if not nxt:
             break
         # nextPageToken usually needs a short delay to become valid
-        time.sleep(2.1)
+        time.sleep(2.0)
+        token = (nxt, page_size)
     return results[:total_needed]
 
-def place_details(place_id: str, include_reviews: bool = False) -> Dict[str, Any]:
+# ---- Cache heavy calls for speed (session-scoped; safe with TTL)
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_place_details(place_id: str, include_reviews: bool = False) -> Dict[str, Any]:
     fields = DETAIL_FIELDS_BASE + (",reviews" if include_reviews else "")
     return _get_json(DETAIL_URL.format(place_id=place_id), headers=_headers(fields))
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_crawl_site(url: str) -> Dict[str, Any]:
+    try:
+        return crawl_doctor_site(url) or {}
+    except Exception:
+        return {}
 
 def summarize_reviews(reviews: List[Dict[str, Any]]) -> str:
     if not reviews:
@@ -232,7 +261,7 @@ def make_recommendation(rating: Optional[float], count: Optional[int]) -> str:
     return "Consider with caution"
 
 # =========================
-# Sidebar controls
+# Sidebar controls (unchanged labels/fields)
 # =========================
 with st.sidebar:
     st.header("Filters")
@@ -277,31 +306,29 @@ if run:
         query = f"{sp} in {area}"
         status.info(f"Searching: **{query}** (target {per_specialty_budget})")
 
-        # Text Search with robust pagination (20 per page + 2s token delay)
+        # Text Search with robust pagination (20 per page + delay for token)
         try:
             place_summaries = paginate_text_search(query, total_needed=per_specialty_budget, center=center)
-            print(f"\n=== RAW TEXT_SEARCH JSON for {query} ===")
-            print(place_summaries)
         except Exception as e:
             st.warning(f"Text search failed for '{query}': {e}")
             continue
 
-        with ThreadPoolExecutor(max_workers=threads) as ex:
+        # Fetch details concurrently
+        max_workers = max(1, min(threads, 16))
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futures = {}
             for p in place_summaries:
                 pid = p.get("id")
                 if not pid or pid in seen:
                     continue
                 seen.add(pid)
-                futures[ex.submit(retry_request, place_details, pid, include_reviews, tries=4)] = p
+                futures[ex.submit(retry_request, cached_place_details, pid, include_reviews, tries=3)] = p
 
             fetched = 0
             for fut in as_completed(futures):
                 p = futures[fut]
                 try:
                     det = fut.result()
-                    print(f"\n=== RAW PLACE_DETAILS JSON for {p.get('id')} ===")
-                    print(det)
                 except Exception as e:
                     st.info(f"Details failed for {p.get('id')}: {e}")
                     continue
@@ -317,26 +344,21 @@ if run:
                 summary = summarize_reviews(det.get("reviews", [])) if include_reviews else "N/A"
                 recommendation = make_recommendation(rating, count)
 
-                # NEW: combine summary + recommendation into one string/column
-                combined_summary = (
-                    f"{summary}" if summary and summary != "N/A" else ""
-                )
+                # merged summary + recommendation (same field name)
+                combined_summary = (f"{summary}" if summary and summary != "N/A" else "")
                 if recommendation:
-                    if combined_summary:
-                        combined_summary += "\n\nRecommendation: " + recommendation
-                    else:
-                        combined_summary = "Recommendation: " + recommendation
+                    combined_summary = (combined_summary + "\n\nRecommendation: " + recommendation).strip()
                 if not combined_summary:
                     combined_summary = "N/A"
 
                 contact_email, years_exp = "N/A", "N/A"
 
                 if website != "N/A":
-                    crawl_future = ex.submit(crawl_doctor_site, website)
+                    crawl_future = ex.submit(cached_crawl_site, website)
                     try:
-                        info = crawl_future.result(timeout=8)  # timeout so one site doesn’t hang forever
-                        contact_email = info.get("email", "N/A")
-                        years_exp = info.get("years_of_experience", "N/A")
+                        info = crawl_future.result(timeout=8)
+                        contact_email = info.get("email", "N/A") or "N/A"
+                        years_exp = info.get("years_of_experience", "N/A") or "N/A"
                     except Exception:
                         pass
 
@@ -352,8 +374,7 @@ if run:
                         # "Website": website,
                         "Ratings": rating if rating is not None else "N/A",
                         "Reviews": count if count is not None else "N/A",
-                        # single merged column:
-                        "Summary of Pros and Cons with Recommendation": combined_summary,
+                        "Summary of Pros and Cons (reviews) + Recommendation": combined_summary,
                     }
                 )
 
@@ -367,7 +388,7 @@ if run:
     else:
         df = pd.DataFrame(rows)
         st.success(f"Done. {len(df)} rows for {area}.")
-        st.dataframe(df, use_container_width=True)
+        st.dataframe(df, use_container_width=True, hide_index=True)
 
         out_path = f"{area.split(',')[0].lower()}_doctors_streamlit.xlsx".replace(" ", "_")
         df.to_excel(out_path, index=False)
