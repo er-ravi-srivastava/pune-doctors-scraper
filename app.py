@@ -348,7 +348,7 @@ if run:
                         "Years of experience": years_exp if years_exp else "N/A",
                         "Contact number": phone,
                         "Contact email": contact_email if contact_email else "N/A",
-                        "Website": website,
+                        # "Website": website,
                         "Ratings": rating if rating is not None else "N/A",
                         "Reviews": count if count is not None else "N/A",
                         "Summary of Pros and Cons (reviews)": summary,
