@@ -33,11 +33,11 @@ _retries = Retry(
     allowed_methods=["GET", "POST"],
     raise_on_status=False,
 )
-adapter = HTTPAdapter(max_retries=_retries, pool_connections=64, pool_maxsize=64)
+adapter = HTTPAdapter(max_retries=_retries, pool_connections=256, pool_maxsize=256)
 SESSION.mount("https://", adapter)
 SESSION.mount("http://", adapter)
 
-DEFAULT_TIMEOUT = 12  # tighter than before for faster failure
+DEFAULT_TIMEOUT = 8
 
 # =========================
 # API key loading
@@ -149,27 +149,18 @@ def retry_request(fn, *args, **kwargs):
             raise
     raise RuntimeError("Request failed after retries")
 
-# ---- simple area centers for locationBias (meters)
+# ---- area centers
 AREA_CENTERS: dict[str, Tuple[float, float]] = {
     "Aundh, Pune": (18.5606, 73.8077),
     "Baner, Pune": (18.5590, 73.7806),
     "Wakad, Pune": (18.5976, 73.7707),
 }
-AREA_RADIUS_M = 6000  # 6 km circle
+AREA_RADIUS_M = 6000
 
-def text_search_page(
-    query: str,
-    page_token: Optional[str] = None,
-    page_size: int = 20,
-    center: Optional[Tuple[float, float]] = None,
-    radius_m: int = AREA_RADIUS_M,
-) -> Dict[str, Any]:
-    """
-    One Text Search request.
-    - page_size max is 20 (per Google Places Text Search)
-    - include locationBias (circle) if center provided
-    """
-    page_size = max(1, min(page_size, 20))  # cap at 20
+def text_search_page(query: str, page_token: Optional[str] = None,
+                     page_size: int = 20, center: Optional[Tuple[float, float]] = None,
+                     radius_m: int = AREA_RADIUS_M) -> Dict[str, Any]:
+    page_size = max(1, min(page_size, 20))
     payload: Dict[str, Any] = {"textQuery": query, "pageSize": page_size}
     if page_token:
         payload["pageToken"] = page_token
@@ -180,41 +171,33 @@ def text_search_page(
         }
     return _post_json(TEXT_URL, headers=_headers(TEXT_FIELDS), payload=payload)
 
-def paginate_text_search(
-    query: str,
-    total_needed: int,
-    center: Optional[Tuple[float, float]] = None,
-) -> List[Dict[str, Any]]:
-    """
-    Keep calling searchText while:
-    - we have a nextPageToken (becomes valid after ~2s)
-    - we still need more results
-    """
+def paginate_text_search(query: str, total_needed: int,
+                         center: Optional[Tuple[float, float]] = None) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
-    token: Optional[Tuple[str, int]] = None  # (token, page_size)
+    token: Optional[Tuple[str, int]] = None
     while len(results) < total_needed:
         remaining = total_needed - len(results)
         page_size = min(20, remaining)
         data = retry_request(
-            text_search_page, query, page_token=(token[0] if token else None), page_size=page_size, center=center
+            text_search_page, query, page_token=(token[0] if token else None),
+            page_size=page_size, center=center
         )
         page_places = data.get("places") or []
         results.extend(page_places)
         nxt = data.get("nextPageToken")
         if not nxt:
             break
-        # nextPageToken usually needs a short delay to become valid
         time.sleep(2.0)
         token = (nxt, page_size)
     return results[:total_needed]
 
-# ---- Cache heavy calls for speed (session-scoped; safe with TTL)
-@st.cache_data(ttl=3600, show_spinner=False)
-def cached_place_details(place_id: str, include_reviews: bool = False) -> Dict[str, Any]:
-    fields = DETAIL_FIELDS_BASE + (",reviews" if include_reviews else "")
+# ---- Cache heavy calls for speed
+@st.cache_data(ttl=7200, show_spinner=False)
+def cached_place_details(place_id: str, include_reviews: bool = True) -> Dict[str, Any]:
+    fields = DETAIL_FIELDS_BASE + ",reviews"
     return _get_json(DETAIL_URL.format(place_id=place_id), headers=_headers(fields))
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=7200, show_spinner=False)
 def cached_crawl_site(url: str) -> Dict[str, Any]:
     try:
         return crawl_doctor_site(url) or {}
@@ -234,7 +217,8 @@ def summarize_reviews(reviews: List[Dict[str, Any]]) -> str:
 
 # ---- name parsing
 _DOCTOR_PAT = re.compile(r"\bDr\.?\s*[A-Z][A-Za-z.\- ]{1,60}", flags=re.UNICODE)
-_CLINIC_WORDS = ("clinic", "hospital", "medical", "centre", "center", "diagnostic", "labs", "skin", "laser", "hair")
+_CLINIC_WORDS = ("clinic", "hospital", "medical", "centre", "center",
+                 "diagnostic", "labs", "skin", "laser", "hair")
 
 def split_doctor_and_clinic(place_name: str) -> Tuple[str, str]:
     if not place_name:
@@ -261,7 +245,7 @@ def make_recommendation(rating: Optional[float], count: Optional[int]) -> str:
     return "Consider with caution"
 
 # =========================
-# Sidebar controls (unchanged labels/fields)
+# Sidebar controls
 # =========================
 with st.sidebar:
     st.header("Filters")
@@ -282,9 +266,8 @@ with st.sidebar:
         ],
         default=["dermatologist", "cardiologist", "pediatrician"],
     )
-    max_total_results = st.slider("Max results (area total)" , 10, 100, 10, step=5)
-    include_reviews = st.checkbox("Include review snippets", value=False)
-    threads = st.slider("Parallel requests", 1, 10, 6)
+    max_total_results = st.slider("Max results (area total)", 10, 100, 10, step=5)
+    threads = st.slider("Parallel requests", 1, 20, 12)
     run = st.button("Find Doctors")
 
 # =========================
@@ -306,15 +289,13 @@ if run:
         query = f"{sp} in {area}"
         status.info(f"Searching: **{query}** (target {per_specialty_budget})")
 
-        # Text Search with robust pagination (20 per page + delay for token)
         try:
             place_summaries = paginate_text_search(query, total_needed=per_specialty_budget, center=center)
         except Exception as e:
             st.warning(f"Text search failed for '{query}': {e}")
             continue
 
-        # Fetch details concurrently
-        max_workers = max(1, min(threads, 16))
+        max_workers = max(1, min(threads, 32))
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futures = {}
             for p in place_summaries:
@@ -322,7 +303,7 @@ if run:
                 if not pid or pid in seen:
                     continue
                 seen.add(pid)
-                futures[ex.submit(retry_request, cached_place_details, pid, include_reviews, tries=3)] = p
+                futures[ex.submit(retry_request, cached_place_details, pid, True, tries=3)] = p
 
             fetched = 0
             for fut in as_completed(futures):
@@ -341,11 +322,10 @@ if run:
                 website = det.get("websiteUri", "") or "N/A"
                 rating = det.get("rating")
                 count = det.get("userRatingCount")
-                summary = summarize_reviews(det.get("reviews", [])) if include_reviews else "N/A"
+                summary = summarize_reviews(det.get("reviews", [])) or "N/A"
                 recommendation = make_recommendation(rating, count)
 
-                # merged summary + recommendation (same field name)
-                combined_summary = (f"{summary}" if summary and summary != "N/A" else "")
+                combined_summary = (summary if summary and summary != "N/A" else "")
                 if recommendation:
                     combined_summary = (combined_summary + "\n\nRecommendation: " + recommendation).strip()
                 if not combined_summary:
@@ -356,7 +336,7 @@ if run:
                 if website != "N/A":
                     crawl_future = ex.submit(cached_crawl_site, website)
                     try:
-                        info = crawl_future.result(timeout=8)
+                        info = crawl_future.result(timeout=4)
                         contact_email = info.get("email", "N/A") or "N/A"
                         years_exp = info.get("years_of_experience", "N/A") or "N/A"
                     except Exception:
@@ -371,7 +351,6 @@ if run:
                         "Years of experience": years_exp if years_exp else "N/A",
                         "Contact number": phone,
                         "Contact email": contact_email if contact_email else "N/A",
-                        # "Website": website,
                         "Ratings": rating if rating is not None else "N/A",
                         "Reviews": count if count is not None else "N/A",
                         "Summary of Pros and Cons and Recommendation": combined_summary,
