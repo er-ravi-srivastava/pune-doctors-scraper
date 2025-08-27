@@ -4,7 +4,7 @@
 # Google Places API (v1) with robust pagination (up to 500 target)
 # ---------------------------------------------
 from __future__ import annotations
-from crawler import crawl_doctor_site 
+from crawler import crawl_doctor_site
 import os
 import re
 import time
@@ -317,17 +317,19 @@ if run:
                 summary = summarize_reviews(det.get("reviews", [])) if include_reviews else "N/A"
                 recommendation = make_recommendation(rating, count)
 
-                contact_email, years_exp = "N/A", "N/A"
+                # NEW: combine summary + recommendation into one string/column
+                combined_summary = (
+                    f"{summary}" if summary and summary != "N/A" else ""
+                )
+                if recommendation:
+                    if combined_summary:
+                        combined_summary += "\n\nRecommendation: " + recommendation
+                    else:
+                        combined_summary = "Recommendation: " + recommendation
+                if not combined_summary:
+                    combined_summary = "N/A"
 
-                # if website != "N/A":
-                #     try:
-                #         info = crawl_doctor_site(website)
-                #         if info.get("email"):
-                #             contact_email = info["email"]
-                #         if info.get("experience"):
-                #             years_exp = info["experience"]
-                #     except Exception as e:
-                #         st.info(f"Failed to crawl {website}: {e}")
+                contact_email, years_exp = "N/A", "N/A"
 
                 if website != "N/A":
                     crawl_future = ex.submit(crawl_doctor_site, website)
@@ -335,9 +337,8 @@ if run:
                         info = crawl_future.result(timeout=8)  # timeout so one site doesn’t hang forever
                         contact_email = info.get("email", "N/A")
                         years_exp = info.get("years_of_experience", "N/A")
-                    except Exception as e:
+                    except Exception:
                         pass
-
 
                 rows.append(
                     {
@@ -351,8 +352,8 @@ if run:
                         # "Website": website,
                         "Ratings": rating if rating is not None else "N/A",
                         "Reviews": count if count is not None else "N/A",
-                        "Summary of Pros and Cons (reviews)": summary,
-                        "Recommendation": recommendation,
+                        # single merged column:
+                        "Summary of Pros and Cons with Recommendation": combined_summary,
                     }
                 )
 
