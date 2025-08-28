@@ -60,10 +60,10 @@ def load_api_key() -> Optional[str]:
 API_KEY = load_api_key()
 if not API_KEY:
     st.error(
-        "Missing **GOOGLE API key**.\n\n"
-        "Add it in `.streamlit/secrets.toml` as:\n"
-        "```\n[api]\ngoogle_api_key = \"YOUR_KEY\"\n```\n"
-        "Or set an environment variable `GOOGLE_API_KEY` (you can use a `.env` file)."
+        "Missing *GOOGLE API key*.\n\n"
+        "Add it in .streamlit/secrets.toml as:\n"
+        "\n[api]\ngoogle_api_key = \"YOUR_KEY\"\n\n"
+        "Or set an environment variable GOOGLE_API_KEY (you can use a .env file)."
     )
     st.stop()
 
@@ -173,9 +173,15 @@ def text_search_page(query: str, page_token: Optional[str] = None,
 
 def paginate_text_search(query: str, total_needed: int,
                          center: Optional[Tuple[float, float]] = None) -> List[Dict[str, Any]]:
+    """Paginate through Google Places API results.
+    Note: Google Places API may limit total results per query to around 60-120 places
+    even if more exist, due to API restrictions."""
     results: List[Dict[str, Any]] = []
     token: Optional[Tuple[str, int]] = None
-    while len(results) < total_needed:
+    pages_fetched = 0
+    max_pages = 25  # Safety limit - API typically returns 3-6 pages max
+    
+    while len(results) < total_needed and pages_fetched < max_pages:
         remaining = total_needed - len(results)
         page_size = min(20, remaining)
         data = retry_request(
@@ -184,10 +190,13 @@ def paginate_text_search(query: str, total_needed: int,
         )
         page_places = data.get("places") or []
         results.extend(page_places)
+        pages_fetched += 1
+        
         nxt = data.get("nextPageToken")
         if not nxt:
             break
-        time.sleep(2.0)
+        # Reduced delay for faster fetching
+        time.sleep(1.5)
         token = (nxt, page_size)
     return results[:total_needed]
 
@@ -266,7 +275,8 @@ with st.sidebar:
         ],
         default=["dermatologist", "cardiologist", "pediatrician"],
     )
-    max_total_results = st.slider("Max results (area total)", 10, 100, 10, step=5)
+    max_total_results = st.slider("Max results (area total)", 10, 500, 20, step=10)
+    st.info("Note: Google Places API typically returns 60-120 results max per query due to API limitations, even if more places exist.")
     threads = st.slider("Parallel requests", 1, 20, 12)
     run = st.button("Find Doctors")
 
@@ -286,13 +296,34 @@ if run:
     per_specialty_budget = max_total_results // max(1, len(specialties))
 
     for idx, sp in enumerate(specialties, start=1):
-        query = f"{sp} in {area}"
-        status.info(f"Searching: **{query}** (target {per_specialty_budget})")
-
-        try:
-            place_summaries = paginate_text_search(query, total_needed=per_specialty_budget, center=center)
-        except Exception as e:
-            st.warning(f"Text search failed for '{query}': {e}")
+        # Use multiple search queries to get more results
+        search_variations = [
+            f"{sp} in {area}",
+            f"{sp} doctor {area}",
+            f"{sp} clinic {area}",
+            f"{sp} specialist {area}",
+        ]
+        
+        place_summaries = []
+        remaining_budget = per_specialty_budget
+        
+        for query in search_variations:
+            if remaining_budget <= 0:
+                break
+                
+            status.info(f"Searching: *{query}* (target {remaining_budget})")
+            
+            try:
+                results = paginate_text_search(query, total_needed=remaining_budget, center=center)
+                # Filter out duplicates based on place ID
+                new_results = [p for p in results if p.get("id") not in seen]
+                place_summaries.extend(new_results)
+                remaining_budget = per_specialty_budget - len(place_summaries)
+            except Exception as e:
+                st.warning(f"Text search failed for '{query}': {e}")
+                continue
+        
+        if not place_summaries:
             continue
 
         max_workers = max(1, min(threads, 32))
@@ -348,9 +379,9 @@ if run:
                         "Doctor name": doc_name if doc_name else "N/A",
                         "Specialty": sp.title(),
                         "Clinic/Hospital": clinic_name if clinic_name else "N/A",
-                        "Years of experience": years_exp if years_exp else "N/A",
+                        "Years of Experience": years_exp,
                         "Contact number": phone,
-                        "Contact email": contact_email if contact_email else "N/A",
+                        "Contact Email Address": contact_email,
                         "Ratings": rating if rating is not None else "N/A",
                         "Reviews": count if count is not None else "N/A",
                         "Summary of Pros and Cons and Recommendation": combined_summary,
@@ -358,7 +389,7 @@ if run:
                 )
 
                 fetched += 1
-                status.write(f"Fetched details {fetched}/{len(place_summaries)} for **{query}**")
+                status.write(f"Fetched details {fetched}/{len(place_summaries)} for *{query}*")
 
         progress.progress(int(idx / max(1, len(specialties)) * 100))
 
@@ -369,7 +400,7 @@ if run:
         st.success(f"Done. {len(df)} rows for {area}.")
         st.dataframe(df, use_container_width=True, hide_index=True)
 
-        out_path = f"{area.split(',')[0].lower()}_doctors_streamlit.xlsx".replace(" ", "_")
+        out_path = f"{area.split(',')[0].lower()}doctors_streamlit.xlsx".replace(" ", "")
         df.to_excel(out_path, index=False)
         with open(out_path, "rb") as f:
             st.download_button(
