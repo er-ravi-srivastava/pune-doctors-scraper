@@ -1,13 +1,7 @@
 # app.py
-# ---------------------------------------------
-# Search Doctors and Clinics in Pune (Streamlit)
-# Google Places API (v1) with robust pagination (up to 500 target)
-# ---------------------------------------------
 from __future__ import annotations
 from crawler import crawl_doctor_site
-import os
-import re
-import time
+import os, re, time, math, json, pathlib
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -16,396 +10,322 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import streamlit as st
 
-# =========================
-# Streamlit page config
-# =========================
+# =============== Page setup ===============
 st.set_page_config(page_title="Search Doctors and Clinics in Pune", layout="wide")
 st.title("Search Doctors and Clinics in Pune")
 
-# =========================
-# HTTP session with pooling & retries (faster)
-# =========================
+# =============== HTTP session ===============
 SESSION = requests.Session()
-_retries = Retry(
-    total=3,
-    backoff_factor=0.6,
-    status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods=["GET", "POST"],
-    raise_on_status=False,
-)
+_retries = Retry(total=3, backoff_factor=0.6,
+                 status_forcelist=[429, 500, 502, 503, 504],
+                 allowed_methods=["GET", "POST"], raise_on_status=False)
 adapter = HTTPAdapter(max_retries=_retries, pool_connections=256, pool_maxsize=256)
-SESSION.mount("https://", adapter)
-SESSION.mount("http://", adapter)
-
+SESSION.mount("https://", adapter); SESSION.mount("http://", adapter)
 DEFAULT_TIMEOUT = 8
 
-# =========================
-# API key loading
-# =========================
+# =============== API key ===============
 def load_api_key() -> Optional[str]:
     try:
-        section = st.secrets.get("api", {})
-        if section and "google_api_key" in section:
-            return section["google_api_key"].strip()
-    except Exception:
-        pass
+        sec = st.secrets.get("api", {})
+        if sec and "google_api_key" in sec: return sec["google_api_key"].strip()
+    except Exception: pass
     try:
-        from dotenv import load_dotenv
-        load_dotenv()
-    except Exception:
-        pass
+        from dotenv import load_dotenv; load_dotenv()
+    except Exception: pass
     k = os.getenv("GOOGLE_API_KEY")
     return k.strip() if k else None
 
 API_KEY = load_api_key()
 if not API_KEY:
-    st.error(
-        "Missing *GOOGLE API key*.\n\n"
-        "Add it in .streamlit/secrets.toml as:\n"
-        "\n[api]\ngoogle_api_key = \"YOUR_KEY\"\n\n"
-        "Or set an environment variable GOOGLE_API_KEY (you can use a .env file)."
-    )
+    st.error("Missing *GOOGLE_API_KEY*. Put it in `.streamlit/secrets.toml` or env.")
     st.stop()
 
-# =========================
-# HTTP / endpoints / fields
-# =========================
-TEXT_URL = "https://places.googleapis.com/v1/places:searchText"
+# =============== Endpoints & fields ===============
+TEXT_URL   = "https://places.googleapis.com/v1/places:searchText"
 DETAIL_URL = "https://places.googleapis.com/v1/places/{place_id}"
 
-TEXT_FIELDS = ",".join(
-    [
-        "places.id",
-        "places.displayName",
-        "places.formattedAddress",
-        "places.types",
-        "places.rating",
-        "places.userRatingCount",
-    ]
-)
+TEXT_FIELDS = ",".join([
+    "places.id","places.displayName","places.formattedAddress","places.types",
+    "places.rating","places.userRatingCount","places.websiteUri",
+    "places.nationalPhoneNumber","places.internationalPhoneNumber",
+])
+DETAIL_FIELDS_FAST = ",".join([
+    "id","displayName","formattedAddress","types","websiteUri",
+    "nationalPhoneNumber","internationalPhoneNumber","rating","userRatingCount",
+])
+DETAIL_FIELDS_FULL = DETAIL_FIELDS_FAST + ",reviews"
 
-DETAIL_FIELDS_BASE = ",".join(
-    [
-        "id",
-        "displayName",
-        "formattedAddress",
-        "types",
-        "websiteUri",
-        "nationalPhoneNumber",
-        "internationalPhoneNumber",
-        "rating",
-        "userRatingCount",
-    ]
-)
-
-def _headers(field_mask: str) -> dict:
-    return {
-        "Content-Type": "application/json",
-        "X-Goog-Api-Key": API_KEY,
-        "X-Goog-FieldMask": field_mask,
-    }
+def _headers(mask: str) -> dict:
+    return {"Content-Type":"application/json","X-Goog-Api-Key":API_KEY,"X-Goog-FieldMask":mask}
 
 def _post_json(url: str, headers: dict, payload: dict, timeout: int = DEFAULT_TIMEOUT) -> dict:
     r = SESSION.post(url, headers=headers, json=payload, timeout=timeout)
     if r.status_code >= 400:
-        try:
-            st.warning(r.json())
-        except Exception:
-            st.warning(r.text)
+        try: st.warning(r.json())
+        except Exception: st.warning(r.text)
         r.raise_for_status()
     return r.json()
 
 def _get_json(url: str, headers: dict, timeout: int = DEFAULT_TIMEOUT) -> dict:
     r = SESSION.get(url, headers=headers, timeout=timeout)
     if r.status_code >= 400:
-        try:
-            st.warning(r.json())
-        except Exception:
-            st.warning(r.text)
+        try: st.warning(r.json())
+        except Exception: st.warning(r.text)
         r.raise_for_status()
     return r.json()
 
-# =========================
-# Helpers
-# =========================
-def backoff_sleep(attempt: int) -> None:
-    time.sleep(0.9 * (attempt + 1))
+# =============== Helpers ===============
+def backoff_sleep(attempt: int) -> None: time.sleep(0.9 * (attempt + 1))
 
 def retry_request(fn, *args, **kwargs):
     tries = kwargs.pop("tries", 3)
     for attempt in range(tries):
-        try:
-            return fn(*args, **kwargs)
+        try: return fn(*args, **kwargs)
         except requests.HTTPError as e:
             code = getattr(e.response, "status_code", None)
-            if code in {429, 500, 502, 503, 504} and attempt < tries - 1:
-                backoff_sleep(attempt)
-                continue
+            if code in {429,500,502,503,504} and attempt < tries-1:
+                backoff_sleep(attempt); continue
             raise
         except requests.RequestException:
-            if attempt < tries - 1:
-                backoff_sleep(attempt)
-                continue
+            if attempt < tries-1: backoff_sleep(attempt); continue
             raise
     raise RuntimeError("Request failed after retries")
 
-# ---- area centers
-AREA_CENTERS: dict[str, Tuple[float, float]] = {
+AREA_CENTERS: dict[str, Tuple[float,float]] = {
     "Aundh, Pune": (18.5606, 73.8077),
     "Baner, Pune": (18.5590, 73.7806),
     "Wakad, Pune": (18.5976, 73.7707),
 }
-AREA_RADIUS_M = 6000
 
-def text_search_page(query: str, page_token: Optional[str] = None,
-                     page_size: int = 20, center: Optional[Tuple[float, float]] = None,
-                     radius_m: int = AREA_RADIUS_M) -> Dict[str, Any]:
+def build_grid(center: Tuple[float,float], radius_m=2900, step_m=1800, size=4) -> List[Tuple[float,float]]:
+    lat0,lng0 = center
+    m_per_deg_lat = 111_320
+    m_per_deg_lng = 111_320 * math.cos(math.radians(lat0))
+    dlat, dlng = step_m/m_per_deg_lat, step_m/m_per_deg_lng
+    offs = [i - (size-1)/2 for i in range(size)]
+    pts = [(lat0+oy*dlat, lng0+ox*dlng) for oy in offs for ox in offs]
+    if center not in pts: pts.append(center)
+    return pts
+
+def text_search_page(query: str, page_token: Optional[str]=None, page_size: int=20,
+                     center: Optional[Tuple[float,float]]=None, radius_m: int=2900) -> Dict[str,Any]:
     page_size = max(1, min(page_size, 20))
-    payload: Dict[str, Any] = {"textQuery": query, "pageSize": page_size}
-    if page_token:
-        payload["pageToken"] = page_token
+    payload: Dict[str,Any] = {"textQuery": query, "pageSize": page_size}
+    if page_token: payload["pageToken"] = page_token
     if center:
-        lat, lng = center
-        payload["locationBias"] = {
-            "circle": {"center": {"latitude": lat, "longitude": lng}, "radius": radius_m}
-        }
+        lat,lng = center
+        payload["locationBias"] = {"circle":{"center":{"latitude":lat,"longitude":lng},"radius":radius_m}}
     return _post_json(TEXT_URL, headers=_headers(TEXT_FIELDS), payload=payload)
 
 def paginate_text_search(query: str, total_needed: int,
-                         center: Optional[Tuple[float, float]] = None) -> List[Dict[str, Any]]:
-    """Paginate through Google Places API results.
-    Note: Google Places API may limit total results per query to around 60-120 places
-    even if more exist, due to API restrictions."""
-    results: List[Dict[str, Any]] = []
-    token: Optional[Tuple[str, int]] = None
-    pages_fetched = 0
-    max_pages = 25  # Safety limit - API typically returns 3-6 pages max
-    
-    while len(results) < total_needed and pages_fetched < max_pages:
+                         center: Optional[Tuple[float,float]]=None, radius_m: int=2900) -> List[Dict[str,Any]]:
+    results: List[Dict[str,Any]] = []; token=None; pages=0
+    while len(results) < total_needed and pages < 25:
         remaining = total_needed - len(results)
-        page_size = min(20, remaining)
-        data = retry_request(
-            text_search_page, query, page_token=(token[0] if token else None),
-            page_size=page_size, center=center
-        )
-        page_places = data.get("places") or []
-        results.extend(page_places)
-        pages_fetched += 1
-        
-        nxt = data.get("nextPageToken")
-        if not nxt:
-            break
-        # Reduced delay for faster fetching
+        data = retry_request(text_search_page, query, page_token=token,
+                             page_size=min(20,remaining), center=center, radius_m=radius_m)
+        results.extend(data.get("places") or []); pages += 1
+        token = data.get("nextPageToken")
+        if not token: break
         time.sleep(1.5)
-        token = (nxt, page_size)
     return results[:total_needed]
 
-# ---- Cache heavy calls for speed
 @st.cache_data(ttl=7200, show_spinner=False)
-def cached_place_details(place_id: str, include_reviews: bool = True) -> Dict[str, Any]:
-    fields = DETAIL_FIELDS_BASE + ",reviews"
+def cached_place_details(place_id: str, want_reviews: bool) -> Dict[str,Any]:
+    fields = DETAIL_FIELDS_FULL if want_reviews else DETAIL_FIELDS_FAST
     return _get_json(DETAIL_URL.format(place_id=place_id), headers=_headers(fields))
 
 @st.cache_data(ttl=7200, show_spinner=False)
-def cached_crawl_site(url: str) -> Dict[str, Any]:
-    try:
-        return crawl_doctor_site(url) or {}
-    except Exception:
-        return {}
+def cached_crawl_site(url: str) -> Dict[str,Any]:
+    try: return crawl_doctor_site(url) or {}
+    except Exception: return {}
 
-def summarize_reviews(reviews: List[Dict[str, Any]]) -> str:
-    if not reviews:
-        return "N/A"
-    snippets: List[str] = []
+def summarize_reviews(reviews: List[Dict[str,Any]]) -> str:
+    if not reviews: return "N/A"
+    snippets = []
     for rv in reviews[:5]:
-        t = (rv.get("text") or {}).get("text", "")
-        if t:
-            t = t.strip().replace("\n", " ")
-            snippets.append(t[:140])
+        t = (rv.get("text") or {}).get("text",""); 
+        if t: snippets.append(t.strip().replace("\n"," ")[:140])
     return " | ".join(snippets) if snippets else "N/A"
 
-# ---- name parsing
-_DOCTOR_PAT = re.compile(r"\bDr\.?\s*[A-Z][A-Za-z.\- ]{1,60}", flags=re.UNICODE)
-_CLINIC_WORDS = ("clinic", "hospital", "medical", "centre", "center",
-                 "diagnostic", "labs", "skin", "laser", "hair")
+_DOCTOR_PAT = re.compile(r"\bDr\.?\s*[A-Z][A-Za-z.\- ]{1,60}", re.UNICODE)
+_CLINIC_WORDS = ("clinic","hospital","medical","centre","center","diagnostic","labs","skin","laser","hair")
 
-def split_doctor_and_clinic(place_name: str) -> Tuple[str, str]:
-    if not place_name:
-        return "N/A", "N/A"
-    name = place_name.strip()
-    low = name.lower()
+def split_doctor_and_clinic(place_name: str) -> Tuple[str,str]:
+    if not place_name: return "N/A","N/A"
+    name = place_name.strip(); low = name.lower()
     m = _DOCTOR_PAT.search(name)
     if m:
-        doc = m.group(0).strip(" -|,")
-        rest = (name[:m.start()] + name[m.end():]).strip(" -|,")
+        doc = m.group(0).strip(" -|,"); rest = (name[:m.start()] + name[m.end():]).strip(" -|,")
         clinic = rest if (rest and any(w in rest.lower() for w in _CLINIC_WORDS)) else "N/A"
         return doc, clinic
-    if any(w in low for w in _CLINIC_WORDS):
-        return "N/A", name
-    return "N/A", name
+    if any(w in low for w in _CLINIC_WORDS): return "N/A",name
+    return "N/A",name
 
 def make_recommendation(rating: Optional[float], count: Optional[int]) -> str:
-    if rating is None or count is None or count == 0:
-        return "Insufficient data"
-    if rating >= 4.5 and count >= 50:
-        return "Highly recommended"
-    if rating >= 4.0 and count >= 10:
-        return "Recommended"
+    if rating is None or count is None or count == 0: return "Insufficient data"
+    if rating >= 4.5 and count >= 50: return "Highly recommended"
+    if rating >= 4.0 and count >= 10: return "Recommended"
     return "Consider with caution"
 
-# =========================
-# Sidebar controls
-# =========================
+# =============== UI (simplified) ===============
 with st.sidebar:
     st.header("Filters")
-    area = st.selectbox("Area", ["Aundh, Pune", "Baner, Pune", "Wakad, Pune"], index=0)
+    area = st.selectbox("Area", list(AREA_CENTERS.keys()), index=0)
     specialties = st.multiselect(
         "Specialties",
-        [
-            "cardiologist",
-            "dermatologist",
-            "neurologist",
-            "oncologist",
-            "general surgeon",
-            "orthopedic",
-            "neurosurgeon",
-            "pediatrician",
-            "gynecologist",
-            "psychiatrist",
-        ],
-        default=["dermatologist", "cardiologist", "pediatrician"],
+        ["cardiologist","dermatologist","pediatrician","gynecologist","psychiatrist",
+         "neurologist","oncologist","general surgeon","orthopedic","neurosurgeon",
+         "dentist","urologist","ent","physiotherapist"],
+        default=["dermatologist","pediatrician","cardiologist"]
     )
-    max_total_results = st.slider("Max results (area total)", 10, 500, 20, step=10)
-    st.info("Note: Google Places API typically returns 60-120 results max per query due to API limitations, even if more places exist.")
-    threads = st.slider("Parallel requests", 1, 20, 12)
+    target_total = st.slider("Target results per area", 50, 600, 350, step=25)
+
+    preset = st.radio("Speed preset", ["Turbo (max)", "Balanced", "Careful"], index=0)
+    with st.expander("Advanced (optional)"):
+        st.markdown("These are set automatically by the preset above.")
+        st.caption("Turbo = max threads, Fast mode ON, dense grid (4×4), small radius (≈2.9 km)")
     run = st.button("Find Doctors")
 
-# =========================
-# Run search
-# =========================
+# Preset mapping (kept simple)
+if preset == "Turbo (max)":
+    fast_mode = True
+    details_threads, crawl_threads = 32, 12
+    grid_size, grid_radius, grid_step = 4, 2900, 1800
+elif preset == "Balanced":
+    fast_mode = True
+    details_threads, crawl_threads = 20, 8
+    grid_size, grid_radius, grid_step = 3, 3200, 2200
+else:  # Careful
+    fast_mode = False
+    details_threads, crawl_threads = 12, 6
+    grid_size, grid_radius, grid_step = 3, 3500, 2500
+
+# =============== Run search ===============
 if run:
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    progress = st.progress(0)
-    status = st.empty()
-
-    rows: List[Dict[str, Any]] = []
-    seen: set[str] = set()
+    progress = st.progress(0); status = st.empty()
+    rows: List[Dict[str,Any]] = []; seen: set[str] = set()
 
     center = AREA_CENTERS.get(area)
-    per_specialty_budget = max_total_results // max(1, len(specialties))
+    grid_points = build_grid(center, radius_m=grid_radius, step_m=grid_step, size=grid_size) if center else [None]
 
-    for idx, sp in enumerate(specialties, start=1):
-        # Use multiple search queries to get more results
-        search_variations = [
-            f"{sp} in {area}",
-            f"{sp} doctor {area}",
-            f"{sp} clinic {area}",
-            f"{sp} specialist {area}",
-        ]
-        
-        place_summaries = []
-        remaining_budget = per_specialty_budget
-        
-        for query in search_variations:
-            if remaining_budget <= 0:
-                break
-                
-            status.info(f"Searching: *{query}* (target {remaining_budget})")
-            
-            try:
-                results = paginate_text_search(query, total_needed=remaining_budget, center=center)
-                # Filter out duplicates based on place ID
-                new_results = [p for p in results if p.get("id") not in seen]
-                place_summaries.extend(new_results)
-                remaining_budget = per_specialty_budget - len(place_summaries)
-            except Exception as e:
-                st.warning(f"Text search failed for '{query}': {e}")
-                continue
-        
-        if not place_summaries:
-            continue
+    def phrases(sp: str) -> List[str]:
+        base = [f"{sp} in {area}", f"{sp} doctor {area}", f"{sp} clinic {area}",
+                f"{sp} specialist {area}", f"{sp} hospital {area}"]
+        extras = []
+        if sp == "dermatologist": extras += [f"skin clinic {area}", f"cosmetology {area}"]
+        if sp == "ent": extras += [f"ear nose throat {area}"]
+        if sp == "orthopedic": extras += [f"bone clinic {area}", f"joint replacement {area}"]
+        return base + extras
 
-        max_workers = max(1, min(threads, 32))
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futures = {}
-            for p in place_summaries:
-                pid = p.get("id")
-                if not pid or pid in seen:
-                    continue
-                seen.add(pid)
-                futures[ex.submit(retry_request, cached_place_details, pid, True, tries=3)] = p
+    combos: List[Tuple[str,str,Optional[Tuple[float,float]]]] = []
+    for sp in specialties:
+        for phr in phrases(sp):
+            for gp in grid_points:
+                combos.append((sp, phr, gp))
 
-            fetched = 0
+    fetched_places: List[Dict[str,Any]] = []
+    combo_idx = 0
+
+    cache_file = pathlib.Path(f".cache_{area.split(',')[0].lower()}.json")
+    try:
+        cached_ids = set(json.loads(cache_file.read_text()))
+    except Exception:
+        cached_ids = set()
+
+    while len(fetched_places) < target_total and combo_idx < len(combos):
+        sp, phr, gp = combos[combo_idx]; combo_idx += 1
+        status.info(f"Searching: *{phr}* @ {gp or 'no-bias'} — {len(fetched_places)}/{target_total}")
+        try:
+            batch = paginate_text_search(phr, total_needed=40, center=gp, radius_m=grid_radius)
+        except Exception as e:
+            st.warning(f"Text search failed for '{phr}': {e}"); continue
+
+        for p in batch:
+            pid = p.get("id")
+            if pid and pid not in seen and pid not in cached_ids:
+                seen.add(pid); fetched_places.append(p)
+                if len(fetched_places) >= target_total: break
+
+        progress.progress(min(95, int(len(fetched_places)/max(1,target_total)*100)))
+
+    if fetched_places:
+        cached_ids.update([p["id"] for p in fetched_places if p.get("id")])
+        try: cache_file.write_text(json.dumps(sorted(cached_ids)))
+        except Exception: pass
+
+    if not fetched_places:
+        st.error("No results fetched. Try Balanced preset or add more specialties.")
+    else:
+        # -------- Details (big pool)
+        with ThreadPoolExecutor(max_workers=details_threads) as ex:
+            futures = {ex.submit(retry_request, cached_place_details, p["id"], not fast_mode, tries=3): p
+                       for p in fetched_places if p.get("id")}
+            enriched = []; processed = 0
             for fut in as_completed(futures):
                 p = futures[fut]
-                try:
-                    det = fut.result()
+                try: det = fut.result()
                 except Exception as e:
-                    st.info(f"Details failed for {p.get('id')}: {e}")
-                    continue
+                    st.info(f"Details failed for {p.get('id')}: {e}"); continue
+                website = det.get("websiteUri") or p.get("websiteUri") or "N/A"
+                enriched.append((p, det, website))
+                processed += 1
+                status.write(f"Fetched details {processed}/{len(fetched_places)}")
 
-                place_name = (det.get("displayName") or {}).get("text", "") or ""
+        # -------- Crawls (small pool)
+        def crawl_or_empty(url):
+            if url and url != "N/A": return cached_crawl_site(url) or {}
+            return {}
+        with ThreadPoolExecutor(max_workers=crawl_threads) as ex2:
+            crawl_map = {ex2.submit(crawl_or_empty, web): (p, det, web) for (p, det, web) in enriched}
+            for fut in as_completed(crawl_map):
+                p, det, website = crawl_map[fut]
+                extra = {}
+                try: extra = fut.result()
+                except Exception: pass
+
+                place_name = (det.get("displayName") or {}).get("text","") or ""
                 doc_name, clinic_name = split_doctor_and_clinic(place_name)
-
-                addr = det.get("formattedAddress", "") or "N/A"
-                phone = det.get("internationalPhoneNumber") or det.get("nationalPhoneNumber") or "N/A"
-                website = det.get("websiteUri", "") or "N/A"
-                rating = det.get("rating")
-                count = det.get("userRatingCount")
-                summary = summarize_reviews(det.get("reviews", [])) or "N/A"
+                addr = det.get("formattedAddress","") or p.get("formattedAddress") or "N/A"
+                phone = det.get("internationalPhoneNumber") or det.get("nationalPhoneNumber") \
+                        or p.get("internationalPhoneNumber") or p.get("nationalPhoneNumber") or "N/A"
+                rating = det.get("rating"); count = det.get("userRatingCount")
+                summary = "N/A" if fast_mode else (summarize_reviews(det.get("reviews",[])) or "N/A")
                 recommendation = make_recommendation(rating, count)
+                combined_summary = (summary if summary and summary!="N/A" else "")
+                if recommendation: combined_summary = (combined_summary + "\n\nRecommendation: " + recommendation).strip()
+                if not combined_summary: combined_summary = "N/A"
 
-                combined_summary = (summary if summary and summary != "N/A" else "")
-                if recommendation:
-                    combined_summary = (combined_summary + "\n\nRecommendation: " + recommendation).strip()
-                if not combined_summary:
-                    combined_summary = "N/A"
+                contact_email = extra.get("email") or "N/A"
+                y = extra.get("years_of_experience"); years_exp = str(y) if isinstance(y,int) else (y or "N/A")
+                sp_guess = (p.get("types") or ["N/A"])[0]
 
-                contact_email, years_exp = "N/A", "N/A"
+                rows.append({
+                    "Complete address": addr,
+                    "Doctor name": doc_name if doc_name else "N/A",
+                    "Specialty": sp_guess.title(),
+                    "Clinic/Hospital": clinic_name if clinic_name else "N/A",
+                    "Years of Experience": years_exp,
+                    "Contact number": phone,
+                    "Contact Email Address": contact_email,
+                    "Ratings": rating if rating is not None else "N/A",
+                    "Reviews": count if count is not None else "N/A",
+                    "Summary of Pros and Cons and Recommendation": combined_summary,
+                    "Website": website if website != "N/A" else "N/A",
+                })
 
-                if website != "N/A":
-                    crawl_future = ex.submit(cached_crawl_site, website)
-                    try:
-                        info = crawl_future.result(timeout=4)
-                        contact_email = info.get("email", "N/A") or "N/A"
-                        years_exp = info.get("years_of_experience", "N/A") or "N/A"
-                    except Exception:
-                        pass
+        progress.progress(100)
 
-                rows.append(
-                    {
-                        "Complete address": addr,
-                        "Doctor name": doc_name if doc_name else "N/A",
-                        "Specialty": sp.title(),
-                        "Clinic/Hospital": clinic_name if clinic_name else "N/A",
-                        "Years of Experience": years_exp,
-                        "Contact number": phone,
-                        "Contact Email Address": contact_email,
-                        "Ratings": rating if rating is not None else "N/A",
-                        "Reviews": count if count is not None else "N/A",
-                        "Summary of Pros and Cons and Recommendation": combined_summary,
-                    }
-                )
-
-                fetched += 1
-                status.write(f"Fetched details {fetched}/{len(place_summaries)} for *{query}*")
-
-        progress.progress(int(idx / max(1, len(specialties)) * 100))
-
-    if not rows:
-        st.error("No results fetched. Try a broader query or smaller radius.")
-    else:
-        df = pd.DataFrame(rows)
-        st.success(f"Done. {len(df)} rows for {area}.")
-        st.dataframe(df, use_container_width=True, hide_index=True)
-
-        out_path = f"{area.split(',')[0].lower()}doctors_streamlit.xlsx".replace(" ", "")
-        df.to_excel(out_path, index=False)
-        with open(out_path, "rb") as f:
-            st.download_button(
-                label="Download Excel",
-                data=f,
-                file_name=out_path,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+        if not rows:
+            st.error("No rows built. Try again.")
+        else:
+            df = pd.DataFrame(rows)
+            st.success(f"Done. {len(df)} rows for {area}.")
+            st.dataframe(df, use_container_width=True, hide_index=True)
+            out_path = f"{area.split(',')[0].lower()}doctors_streamlit.xlsx".replace(" ", "")
+            df.to_excel(out_path, index=False)
+            with open(out_path, "rb") as f:
+                st.download_button("Download Excel", f, file_name=out_path,
+                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
