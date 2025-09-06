@@ -1,14 +1,14 @@
-# crawler.py
-import re, json
+import re
+import json
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 from datetime import datetime
-from typing import Optional, Tuple, Dict, Set, List
+from typing import Optional, Tuple, Dict, List
 
+# Patterns for email and obfuscated email forms
 EMAIL_PAT = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", re.I)
 
-# obfuscated: "name [at] domain [dot] com", "name(at)domain(dot)com"
 OBFUSC_EMAIL_PAT = re.compile(
     r"""
     ([A-Za-z0-9._%+\-]+)      # local
@@ -32,8 +32,10 @@ EXP_PAT = re.compile(
     re.I | re.X,
 )
 
+
 def _norm_obfuscated(m: re.Match) -> str:
     return f"{m.group(1)}@{m.group(2)}.{m.group(3)}"
+
 
 def _infer_years_from_year(year: int) -> Optional[int]:
     now = datetime.now().year
@@ -41,18 +43,29 @@ def _infer_years_from_year(year: int) -> Optional[int]:
         return max(0, now - year)
     return None
 
+
 def extract_email_and_exp(text: str) -> Tuple[Optional[str], Optional[int]]:
     email = None
     years = None
 
+    if not text:
+        return None, None
+
+    # direct email
     m = EMAIL_PAT.search(text)
     if m:
         email = m.group(0)
 
-    ob = OBFUSC_EMAIL_PAT.search(text)
-    if not email and ob:
-        email = _norm_obfuscated(ob)
+    # obfuscated email like name [at] domain [dot] com
+    if not email:
+        ob = OBFUSC_EMAIL_PAT.search(text)
+        if ob:
+            try:
+                email = _norm_obfuscated(ob)
+            except Exception:
+                email = None
 
+    # years of experience patterns
     em = EXP_PAT.search(text)
     if em:
         if em.group("num1"):
@@ -72,36 +85,41 @@ def extract_email_and_exp(text: str) -> Tuple[Optional[str], Optional[int]]:
 
     return email, years
 
-def crawl_doctor_site(url: str) -> Dict[str, Optional[object]]:
+
+def fetch_html(url: str, timeout: int = 8) -> Optional[str]:
     session = requests.Session()
-    session.headers.update({"User-Agent": "Mozilla/5.0"})
-
-    def fetch(link: str) -> Optional[str]:
-        try:
-            r = session.get(link, timeout=8)
-            if r.status_code == 200 and r.text:
-                return r.text
-        except requests.RequestException:
-            return None
+    session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; Bot/0.1)"})
+    try:
+        r = session.get(url, timeout=timeout)
+        if r.status_code == 200 and r.text:
+            return r.text
+    except requests.RequestException:
         return None
+    return None
 
-    homepage = fetch(url)
+
+def crawl_doctor_site(url: str) -> Dict[str, Optional[object]]:
+    """
+    Crawl given homepage URL and a small set of candidate pages to extract:
+      - email (if available)
+      - years_of_experience (best-effort)
+    Returns dict {"email": str|None, "years_of_experience": int|None}
+    """
+    homepage = fetch_html(url)
     if not homepage:
         return {"email": None, "years_of_experience": None}
 
     soup = BeautifulSoup(homepage, "html.parser")
 
-    # direct hints first
-    # 1) mailto links
+    # 1) mailto links on homepage
+    email_mailto = None
     for a in soup.select('a[href^="mailto:"]'):
         addr = a.get("href", "")[7:]
         if EMAIL_PAT.fullmatch(addr):
             email_mailto = addr
             break
-    else:
-        email_mailto = None
 
-    # 2) JSON-LD
+    # 2) JSON-LD with "email"
     jsonld_emails: List[str] = []
     for tag in soup.find_all("script", type="application/ld+json"):
         try:
@@ -115,29 +133,30 @@ def crawl_doctor_site(url: str) -> Dict[str, Optional[object]]:
                 if isinstance(em, str):
                     jsonld_emails.append(em.strip())
 
+    # 3) visible text on homepage
     text_home = soup.get_text(" ", strip=True)
     email_text, years_text = extract_email_and_exp(text_home)
 
     email = email_mailto or (jsonld_emails[0] if jsonld_emails else None) or email_text
     years = years_text
 
-    # candidate subpages
-    candidates: Set[str] = set()
+    # candidate subpages to inspect (shallow)
+    candidates: set = set()
     for a in soup.find_all("a", href=True):
         href = a["href"].lower()
-        if any(w in href for w in ["contact", "about", "team", "doctor", "providers", "staff", "meet"]):
+        if any(w in href for w in ["contact", "about", "team", "doctor", "doctors", "providers", "staff", "meet"]):
             candidates.add(urljoin(url, a["href"]))
 
-    # crawl subpages shallowly
+    # crawl up to 8 candidate pages
     for link in list(candidates)[:8]:
         if email and years:
             break
-        html = fetch(link)
+        html = fetch_html(link)
         if not html:
             continue
         s2 = BeautifulSoup(html, "html.parser")
 
-        # more mailto
+        # mailto on subpage
         if not email:
             for a in s2.select('a[href^="mailto:"]'):
                 addr = a.get("href", "")[7:]
@@ -145,7 +164,7 @@ def crawl_doctor_site(url: str) -> Dict[str, Optional[object]]:
                     email = addr
                     break
 
-        # json-ld
+        # json-ld on subpage
         if not email:
             for tag in s2.find_all("script", type="application/ld+json"):
                 try:
@@ -160,6 +179,7 @@ def crawl_doctor_site(url: str) -> Dict[str, Optional[object]]:
                 if email:
                     break
 
+        # extract from visible text
         if not (email and years):
             t2 = s2.get_text(" ", strip=True)
             em2, y2 = extract_email_and_exp(t2)
@@ -170,6 +190,8 @@ def crawl_doctor_site(url: str) -> Dict[str, Optional[object]]:
 
     return {"email": email, "years_of_experience": years}
 
+
 if __name__ == "__main__":
-    url = "https://www.neoskinhair.com/"  # sample
+    # local quick test (change URL as desired)
+    url = "https://www.neoskinhair.com/"
     print(crawl_doctor_site(url))

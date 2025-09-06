@@ -19,7 +19,7 @@ SESSION = requests.Session()
 _retries = Retry(total=3, backoff_factor=0.6,
                  status_forcelist=[429, 500, 502, 503, 504],
                  allowed_methods=["GET", "POST"], raise_on_status=False)
-adapter = HTTPAdapter(max_retries=_retries, pool_connections=256, pool_maxsize=256)
+adapter = HTTPAdapter(max_retries=_retries, pool_connections=64, pool_maxsize=64)
 SESSION.mount("https://", adapter); SESSION.mount("http://", adapter)
 DEFAULT_TIMEOUT = 8
 
@@ -118,7 +118,7 @@ def text_search_page(query: str, page_token: Optional[str]=None, page_size: int=
     return _post_json(TEXT_URL, headers=_headers(TEXT_FIELDS), payload=payload)
 
 def paginate_text_search(query: str, total_needed: int,
-                         center: Optional[Tuple[float,float]]=None, radius_m: int=2900) -> List[Dict[str,Any]]:
+                         center: Optional[Tuple[float,float]]=None, radius_m: int = 2900) -> List[Dict[str,Any]]:
     results: List[Dict[str,Any]] = []; token=None; pages=0
     while len(results) < total_needed and pages < 25:
         remaining = total_needed - len(results)
@@ -144,12 +144,12 @@ def summarize_reviews(reviews: List[Dict[str,Any]]) -> str:
     if not reviews: return "N/A"
     snippets = []
     for rv in reviews[:5]:
-        t = (rv.get("text") or {}).get("text",""); 
+        t = (rv.get("text") or {}).get("text","")
         if t: snippets.append(t.strip().replace("\n"," ")[:140])
     return " | ".join(snippets) if snippets else "N/A"
 
 _DOCTOR_PAT = re.compile(r"\bDr\.?\s*[A-Z][A-Za-z.\- ]{1,60}", re.UNICODE)
-_CLINIC_WORDS = ("clinic","hospital","medical","centre","center","diagnostic","labs","skin","laser","hair")
+_CLINIC_WORDS = ("clinic","hospital","medical","centre","center","diagnostic","labs","skin","laser","hair","institute","speciality")
 
 def split_doctor_and_clinic(place_name: str) -> Tuple[str,str]:
     if not place_name: return "N/A","N/A"
@@ -168,26 +168,40 @@ def make_recommendation(rating: Optional[float], count: Optional[int]) -> str:
     if rating >= 4.0 and count >= 10: return "Recommended"
     return "Consider with caution"
 
-# =============== UI (simplified) ===============
+def _get_display_name(det: Dict[str,Any], p: Dict[str,Any]) -> str:
+    dn = det.get("displayName")
+    if isinstance(dn, dict): return dn.get("text","") or ""
+    if isinstance(dn, str): return dn
+    return (p.get("displayName") or {}).get("text","") if isinstance(p.get("displayName"), dict) else p.get("displayName") or ""
+
+# =============== UI (assignment-specific) ===============
 with st.sidebar:
     st.header("Filters")
     area = st.selectbox("Area", list(AREA_CENTERS.keys()), index=0)
-    specialties = st.multiselect(
-        "Specialties",
-        ["cardiologist","dermatologist","pediatrician","gynecologist","psychiatrist",
-         "neurologist","oncologist","general surgeon","orthopedic","neurosurgeon",
-         "dentist","urologist","ent","physiotherapist"],
-        default=["dermatologist","pediatrician","cardiologist"]
-    )
-    target_total = st.slider("Target results per area", 50, 600, 350, step=25)
 
-    preset = st.radio("Speed preset", ["Turbo (max)", "Balanced", "Careful"], index=0)
-    with st.expander("Advanced (optional)"):
-        st.markdown("These are set automatically by the preset above.")
-        st.caption("Turbo = max threads, Fast mode ON, dense grid (4×4), small radius (≈2.9 km)")
+    # EXACT specialties from the PDF (case + parentheses preserved)
+    specialties = st.multiselect(
+        "Specialties (assignment)",
+        [
+            "Cardiology (heart)",
+            "Dermatology (skin)",
+            "Neurology (brain and nervous system)",
+            "Oncology (cancer)",
+            "General surgery",
+            "Orthopaedics",
+            "Neurosurgery",
+            "Paediatrics (child health)",
+            "Obstetrics/gynaecology (women's health)",
+            "Psychiatry (mental health)",
+        ],
+        default=["Dermatology (skin)", "Paediatrics (child health)", "Cardiology (heart)"],
+    )
+
+    target_total = st.slider("Target results per area", 50, 600, 200, step=25)
+
+    preset = st.radio("Speed preset", ["Turbo (max)", "Balanced", "Careful"], index=1)
     run = st.button("Find Doctors")
 
-# Preset mapping (kept simple)
 if preset == "Turbo (max)":
     fast_mode = True
     details_threads, crawl_threads = 32, 12
@@ -196,7 +210,7 @@ elif preset == "Balanced":
     fast_mode = True
     details_threads, crawl_threads = 20, 8
     grid_size, grid_radius, grid_step = 3, 3200, 2200
-else:  # Careful
+else:
     fast_mode = False
     details_threads, crawl_threads = 12, 6
     grid_size, grid_radius, grid_step = 3, 3500, 2500
@@ -212,13 +226,24 @@ if run:
     grid_points = build_grid(center, radius_m=grid_radius, step_m=grid_step, size=grid_size) if center else [None]
 
     def phrases(sp: str) -> List[str]:
-        base = [f"{sp} in {area}", f"{sp} doctor {area}", f"{sp} clinic {area}",
-                f"{sp} specialist {area}", f"{sp} hospital {area}"]
-        extras = []
-        if sp == "dermatologist": extras += [f"skin clinic {area}", f"cosmetology {area}"]
-        if sp == "ent": extras += [f"ear nose throat {area}"]
-        if sp == "orthopedic": extras += [f"bone clinic {area}", f"joint replacement {area}"]
-        return base + extras
+        # map the exact specialty strings to search phrases - keep simple, include short forms
+        mapping = {
+            "Cardiology (heart)": ["cardiology","cardiologist","heart clinic"],
+            "Dermatology (skin)": ["dermatology","dermatologist","skin clinic","cosmetology"],
+            "Neurology (brain and nervous system)": ["neurology","neurologist","neuro clinic"],
+            "Oncology (cancer)": ["oncology","oncologist","cancer centre"],
+            "General surgery": ["general surgery","general surgeon","surgery"],
+            "Orthopaedics": ["orthopaedics","orthopaedic","bone clinic","joint replacement"],
+            "Neurosurgery": ["neurosurgery","neurosurgeon"],
+            "Paediatrics (child health)": ["paediatrics","paediatrician","child specialist"],
+            "Obstetrics/gynaecology (women's health)": ["obstetrics","gynaecology","obgyn","obstetrician"],
+            "Psychiatry (mental health)": ["psychiatry","psychiatrist"],
+        }
+        keys = mapping.get(sp, [sp])
+        phrases = []
+        for k in keys:
+            phrases.extend([f"{k} in {area}", f"{k} doctor {area}", f"{k} clinic {area}", f"{k} hospital {area}"])
+        return phrases
 
     combos: List[Tuple[str,str,Optional[Tuple[float,float]]]] = []
     for sp in specialties:
@@ -259,7 +284,7 @@ if run:
     if not fetched_places:
         st.error("No results fetched. Try Balanced preset or add more specialties.")
     else:
-        # -------- Details (big pool)
+        # details
         with ThreadPoolExecutor(max_workers=details_threads) as ex:
             futures = {ex.submit(retry_request, cached_place_details, p["id"], not fast_mode, tries=3): p
                        for p in fetched_places if p.get("id")}
@@ -274,11 +299,11 @@ if run:
                 processed += 1
                 status.write(f"Fetched details {processed}/{len(fetched_places)}")
 
-        # -------- Crawls (small pool)
+        # crawls
         def crawl_or_empty(url):
             if url and url != "N/A": return cached_crawl_site(url) or {}
             return {}
-        with ThreadPoolExecutor(max_workers=crawl_threads) as ex2:
+        with ThreadPoolExecutor(max_workers=12) as ex2:
             crawl_map = {ex2.submit(crawl_or_empty, web): (p, det, web) for (p, det, web) in enriched}
             for fut in as_completed(crawl_map):
                 p, det, website = crawl_map[fut]
@@ -286,7 +311,7 @@ if run:
                 try: extra = fut.result()
                 except Exception: pass
 
-                place_name = (det.get("displayName") or {}).get("text","") or ""
+                place_name = _get_display_name(det, p)
                 doc_name, clinic_name = split_doctor_and_clinic(place_name)
                 addr = det.get("formattedAddress","") or p.get("formattedAddress") or "N/A"
                 phone = det.get("internationalPhoneNumber") or det.get("nationalPhoneNumber") \
@@ -302,18 +327,18 @@ if run:
                 y = extra.get("years_of_experience"); years_exp = str(y) if isinstance(y,int) else (y or "N/A")
                 sp_guess = (p.get("types") or ["N/A"])[0]
 
+                # *** EXACT column names from PDF ***
                 rows.append({
                     "Complete address": addr,
-                    "Doctor name": doc_name if doc_name else "N/A",
+                    "Doctors name": doc_name if doc_name else "N/A",
                     "Specialty": sp_guess.title(),
                     "Clinic/Hospital": clinic_name if clinic_name else "N/A",
-                    "Years of Experience": years_exp,
+                    "Years of experience": years_exp,
                     "Contact number": phone,
-                    "Contact Email Address": contact_email,
+                    "Contact email": contact_email,
                     "Ratings": rating if rating is not None else "N/A",
                     "Reviews": count if count is not None else "N/A",
-                    "Summary of Pros and Cons and Recommendation": combined_summary,
-                    "Website": website if website != "N/A" else "N/A",
+                    "Summary of Pros and Cons (Summary of reviews), and recommendation": combined_summary,
                 })
 
         progress.progress(100)
@@ -322,9 +347,23 @@ if run:
             st.error("No rows built. Try again.")
         else:
             df = pd.DataFrame(rows)
+            # enforce exact column order from PDF
+            expected_cols = [
+                "Complete address",
+                "Doctors name",
+                "Specialty",
+                "Clinic/Hospital",
+                "Years of experience",
+                "Contact number",
+                "Contact email",
+                "Ratings",
+                "Reviews",
+                "Summary of Pros and Cons (Summary of reviews), and recommendation",
+            ]
+            df = df.reindex(columns=expected_cols)
             st.success(f"Done. {len(df)} rows for {area}.")
             st.dataframe(df, use_container_width=True, hide_index=True)
-            out_path = f"{area.split(',')[0].lower()}doctors_streamlit.xlsx".replace(" ", "")
+            out_path = f"{area.split(',')[0].lower()}_doctors_assignment.xlsx".replace(" ", "")
             df.to_excel(out_path, index=False)
             with open(out_path, "rb") as f:
                 st.download_button("Download Excel", f, file_name=out_path,
