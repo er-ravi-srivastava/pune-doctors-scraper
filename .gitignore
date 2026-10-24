@@ -13,3 +13,7 @@ __pycache__/
 
 # Excel outputs
 *.xlsx
+
+# Streamlit Secrets (never commit)
+.streamlit/secrets.toml
+
